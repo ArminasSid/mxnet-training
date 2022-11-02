@@ -1,0 +1,11 @@
+# Ignore all
+/*
+
+# Except these files
+!.gitignore
+!requirements.txt
+!train.py
+!README.md
+
+# Except these folders
+
