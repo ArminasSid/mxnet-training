@@ -17,18 +17,12 @@ from gluoncv.model_zoo.segbase import *
 from gluoncv.model_zoo import get_model
 from gluoncv.utils.parallel import *
 from gluoncv.data import get_segmentation_dataset
-from gluoncv.nn.dropblock import set_drop_prob
-from functools import partial
 
 def parse_args():
     """Training Options for Semantic Segmentation Experiments"""
     parser = argparse.ArgumentParser(description='MXNet Gluon Semantic Segmentation')
     # model and dataset
-    parser.add_argument('--save_dir', type=str, default='runs',
-                        help='model save_dir (default: runs)')
-    parser.add_argument('--save_interval', type=int, default=1,
-                        help='how often to save model (epoch % save_interval != 0) (Default: 1)')
-    parser.add_argument('--model', type=str, default='psp',
+    parser.add_argument('--model', type=str, default='fcn',
                         help='model name (default: fcn)')
     parser.add_argument('--root', type=str, default='ade1',
                         help='ade dataset root folder (default: ade)')
@@ -42,10 +36,12 @@ def parse_args():
                         help='dataset name (default: ade20k)')
     parser.add_argument('--workers', type=int, default=16,
                         metavar='N', help='dataloader threads')
-    parser.add_argument('--base-size', type=int, default=200,
+    parser.add_argument('--base-size', type=int, default=520,
                         help='base image size')
-    parser.add_argument('--crop-size', type=int, default=200,
+    parser.add_argument('--crop-size', type=int, default=480,
                         help='crop image size')
+    parser.add_argument('--train-split', type=str, default='train',
+                        help='dataset train split (default: train)')
     # training hyper params
     parser.add_argument('--aux', action='store_true', default=False,
                         help='Auxiliary loss')
@@ -55,16 +51,18 @@ def parse_args():
                         help='number of epochs to train (default: 50)')
     parser.add_argument('--start_epoch', type=int, default=0,
                         metavar='N', help='start epochs (default:0)')
-    parser.add_argument('--batch-size', type=int, default=10,
+    parser.add_argument('--batch-size', type=int, default=16,
                         metavar='N', help='input batch size for \
                         training (default: 16)')
-    parser.add_argument('--test-batch-size', type=int, default=4,
+    parser.add_argument('--test-batch-size', type=int, default=16,
                         metavar='N', help='input batch size for \
                         testing (default: 16)')
     parser.add_argument('--optimizer', type=str, default='sgd',
                         help='optimizer (default: sgd)')
     parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
                         help='learning rate (default: 1e-3)')
+    parser.add_argument('--warmup-epochs', type=int, default=0,
+                        help='number of warmup epochs.')
     parser.add_argument('--momentum', type=float, default=0.9,
                         metavar='M', help='momentum (default: 0.9)')
     parser.add_argument('--weight-decay', type=float, default=1e-4,
@@ -103,7 +101,6 @@ def parse_args():
     # synchronized Batch Normalization
     parser.add_argument('--syncbn', action='store_true', default=False,
                         help='using Synchronized Cross-GPU BatchNorm')
-    
     # the parser
     args = parser.parse_args()
 
@@ -124,8 +121,6 @@ def parse_args():
     # logging and checkpoint saving
     if args.save_dir is None:
         args.save_dir = "runs/%s/%s/%s/" % (args.dataset, args.model, args.backbone)
-    else:
-        args.save_dir = "{}/{}/{}/{}/".format(args.save_dir, args.dataset, args.model, args.backbone)
     makedirs(args.save_dir)
 
     # Synchronized BatchNorm
@@ -138,11 +133,6 @@ class Trainer(object):
     def __init__(self, args, logger):
         self.args = args
         self.logger = logger
-        self.train_stats = 'Stats_Train.txt'
-        self.validation_stats = 'Stats_Validation.txt'
-        self.train_file = open(os.path.join(args.save_dir, self.train_stats), "a") 
-        self.validation_file = open(os.path.join(args.save_dir, self.validation_stats), "a") 
-
 
         # image transform
         input_transform = transforms.Compose([
@@ -174,18 +164,27 @@ class Trainer(object):
                                                last_batch='rollover',
                                                num_workers=args.workers)
 
-        model = get_segmentation_model(model=args.model, dataset=args.dataset,
-                                        backbone=args.backbone, norm_layer=args.norm_layer,
-                                        norm_kwargs=args.norm_kwargs, aux=args.aux,
-                                        base_size=args.base_size, crop_size=args.crop_size)
+        # create network
+        if args.model_zoo is not None:
+            model = get_model(args.model_zoo, norm_layer=args.norm_layer,
+                              norm_kwargs=args.norm_kwargs, aux=args.aux,
+                              base_size=args.base_size, crop_size=args.crop_size,
+                              pretrained=args.pretrained)
+        else:
+            model = get_segmentation_model(model=args.model, dataset=args.dataset,
+                                           backbone=args.backbone, norm_layer=args.norm_layer,
+                                           norm_kwargs=args.norm_kwargs, aux=args.aux,
+                                           base_size=args.base_size, crop_size=args.crop_size)
         # for resnest use only
+        from gluoncv.nn.dropblock import set_drop_prob
+        from functools import partial
         apply_drop_prob = partial(set_drop_prob, 0.0)
         model.apply(apply_drop_prob)
 
         model.cast(args.dtype)
-#         logger.info(model)
+        # logger.info(model)
 
-        self.net = DataParallelModel(model, args.ctx)
+        self.net = DataParallelModel(model, args.ctx, args.syncbn)
         self.evaluator = DataParallelModel(SegEvalModel(model), args.ctx)
         # resume checkpoint if needed
         if args.resume is not None:
@@ -194,13 +193,21 @@ class Trainer(object):
             else:
                 raise RuntimeError("=> no checkpoint found at '{}'".format(args.resume))
 
-        criterion = MixSoftmaxCrossEntropyLoss(args.aux, aux_weight=args.aux_weight)
-        self.criterion = DataParallelCriterion(criterion, args.ctx)
+        # create criterion
+        if 'icnet' in args.model:
+            criterion = ICNetLoss(crop_size=args.crop_size)
+        elif 'danet' in args.model or (args.model_zoo and 'danet' in args.model_zoo):
+            criterion = SegmentationMultiLosses()
+        else:
+            criterion = MixSoftmaxCrossEntropyLoss(args.aux, aux_weight=args.aux_weight)
+        self.criterion = DataParallelCriterion(criterion, args.ctx, args.syncbn)
 
         # optimizer and lr scheduling
         self.lr_scheduler = LRSequential([
+                LRScheduler('linear', base_lr=0, target_lr=args.lr,
+                            nepochs=args.warmup_epochs, iters_per_epoch=len(self.train_data)),
                 LRScheduler(mode='poly', base_lr=args.lr,
-                            nepochs=args.epochs,
+                            nepochs=args.epochs-args.warmup_epochs,
                             iters_per_epoch=len(self.train_data),
                             power=0.9)
             ])
@@ -233,7 +240,6 @@ class Trainer(object):
     def training(self, epoch):
         tbar = tqdm(self.train_data)
         train_loss = 0.0
-        line = ''
         for i, (data, target) in enumerate(tbar):
             with autograd.record(True):
                 outputs = self.net(data.astype(args.dtype, copy=False))
@@ -243,16 +249,13 @@ class Trainer(object):
             self.optimizer.step(self.args.batch_size)
             for loss in losses:
                 train_loss += np.mean(loss.asnumpy()) / len(losses)
-            tbar.set_description('Epoch %d, training loss %.6f' % \
+            tbar.set_description('Epoch %d, training loss %.3f' % \
                 (epoch, train_loss/(i+1)))
-            line = 'Epoch %d iteration %04d/%04d: training loss %.6f' % (epoch, i, len(self.train_data), train_loss/(i+1))
             if i != 0 and i % self.args.log_interval == 0:
-                self.logger.info(line)
+                self.logger.info('Epoch %d iteration %04d/%04d: training loss %.3f' % \
+                    (epoch, i, len(self.train_data), train_loss/(i+1)))
             mx.nd.waitall()
-        print('Info saved to: {}{}'.format(args.save_dir,self.train_stats))
-        print(line)
-        print(line, file=self.train_file)
-            
+
         # save every epoch
         if self.args.no_val:
             save_checkpoint(self.net.module, self.args, epoch, 0, False)
@@ -266,18 +269,13 @@ class Trainer(object):
             targets = mx.gluon.utils.split_and_load(target, args.ctx, even_split=False)
             self.metric.update(targets, outputs)
             pixAcc, mIoU = self.metric.get()
-            tbar.set_description('Epoch %d, validation pixAcc: %.6f, mIoU: %.6f' % \
+            tbar.set_description('Epoch %d, validation pixAcc: %.3f, mIoU: %.3f' % \
                 (epoch, pixAcc, mIoU))
             mx.nd.waitall()
-        line='Epoch %d validation pixAcc: %.6f, mIoU: %.6f' % (epoch, pixAcc, mIoU)
-        self.logger.info(line)
-        print(line, file=self.validation_file)
+        self.logger.info('Epoch %d validation pixAcc: %.3f, mIoU: %.3f' % (epoch, pixAcc, mIoU))
         save_checkpoint(self.net.module, self.args, epoch, mIoU, False)
 
 def save_checkpoint(net, args, epoch, mIoU, is_best=False):
-    if epoch % args.save_interval != 0:
-        print('Model not saved.')
-        return
     """Save Checkpoint"""
     filename = 'epoch_%04d_mIoU_%2.4f.params' % (epoch, mIoU)
     filepath = os.path.join(args.save_dir, filename)
@@ -308,3 +306,4 @@ if __name__ == "__main__":
             trainer.training(epoch)
             if not trainer.args.no_val:
                 trainer.validation(epoch)
+                
